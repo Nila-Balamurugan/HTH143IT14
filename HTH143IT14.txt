@@ -1,0 +1,314 @@
+#include <Arduino.h>
+
+#define FAN1_PIN 18
+#define FAN2_PIN 19
+#define LED_PIN 21
+#define MOTOR_PIN 22
+#define PUMP_PIN 23
+
+#define RELAY_ON LOW
+#define RELAY_OFF HIGH
+
+const float PEAK_LIMIT = 2000.0;
+const float PREDICTION_MARGIN = 100.0;
+
+const int HISTORY_SIZE = 10;
+
+const unsigned long UPDATE_INTERVAL = 2000;
+
+struct Device {
+  String name;
+  float ratedPower;
+  float currentPower;
+  bool enabled;
+  bool shed;
+  int relayPin;
+};
+
+Device devices[] = {
+  {"Fan 1", 250, 250, true, false, FAN1_PIN},
+  {"Fan 2", 150, 150, true, false, FAN2_PIN},
+  {"LED Strip", 100, 100, true, false, LED_PIN},
+  {"Motor", 750, 750, true, false, MOTOR_PIN},
+  {"Pump", 600, 600, true, false, PUMP_PIN}
+};
+
+const int NUM_DEVICES = sizeof(devices) / sizeof(devices[0]);
+
+float powerHistory[HISTORY_SIZE];
+
+int historyIndex = 0;
+bool historyFilled = false;
+
+float totalPower = 0;
+float predictedPower = 0;
+float peakBefore = 0;
+float peakAfter = 0;
+float savedPower = 0;
+
+unsigned long lastUpdate = 0;
+
+void setRelay(int pin, bool state) {
+  digitalWrite(pin, state ? RELAY_ON : RELAY_OFF);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(FAN1_PIN, OUTPUT);
+  pinMode(FAN2_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(MOTOR_PIN, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+
+  setRelay(FAN1_PIN, false);
+  setRelay(FAN2_PIN, false);
+  setRelay(LED_PIN, false);
+  setRelay(MOTOR_PIN, false);
+  setRelay(PUMP_PIN, false);
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    devices[i].currentPower = devices[i].ratedPower;
+    devices[i].enabled = true;
+    devices[i].shed = false;
+  }
+
+  for (int i = 0; i < HISTORY_SIZE; i++) {
+    powerHistory[i] = 0;
+  }
+
+  randomSeed(analogRead(34));
+
+  Serial.println("Peak Shaving Energy Control System Started");
+}
+
+void simulatePower() {
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    if (!devices[i].enabled || devices[i].shed) {
+      devices[i].currentPower = 0;
+      continue;
+    }
+
+    float variation = random(-10, 11);
+
+    devices[i].currentPower =
+      devices[i].ratedPower + variation;
+
+    if (devices[i].currentPower < 0) {
+      devices[i].currentPower = 0;
+    }
+  }
+}
+
+float calculateTotalPower() {
+  float total = 0;
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    total += devices[i].currentPower;
+  }
+
+  return total;
+}
+
+void storePowerHistory(float power) {
+  powerHistory[historyIndex] = power;
+
+  historyIndex++;
+
+  if (historyIndex >= HISTORY_SIZE) {
+    historyIndex = 0;
+    historyFilled = true;
+  }
+}
+
+float predictPower() {
+  int count;
+
+  if (historyFilled) {
+    count = HISTORY_SIZE;
+  } else {
+    count = historyIndex;
+  }
+
+  if (count < 3) {
+    return totalPower;
+  }
+
+  float totalChange = 0;
+
+  for (int i = 1; i < count; i++) {
+    int current =
+      (historyIndex - i + HISTORY_SIZE) % HISTORY_SIZE;
+
+    int previous =
+      (historyIndex - i - 1 + HISTORY_SIZE) % HISTORY_SIZE;
+
+    totalChange +=
+      powerHistory[current] -
+      powerHistory[previous];
+  }
+
+  float averageChange =
+    totalChange / (count - 1);
+
+  float prediction =
+    totalPower + (averageChange * 3);
+
+  if (prediction < 0) {
+    prediction = 0;
+  }
+
+  return prediction;
+}
+
+void performPeakShaving() {
+  if (predictedPower <
+      (PEAK_LIMIT - PREDICTION_MARGIN)) {
+    return;
+  }
+
+  int selectedDevice = -1;
+  float highestPower = 0;
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    if (!devices[i].enabled) {
+      continue;
+    }
+
+    if (devices[i].shed) {
+      continue;
+    }
+
+    if (devices[i].currentPower > highestPower) {
+      highestPower = devices[i].currentPower;
+      selectedDevice = i;
+    }
+  }
+
+  if (selectedDevice >= 0) {
+    devices[selectedDevice].shed = true;
+
+    float removedPower =
+      devices[selectedDevice].currentPower;
+
+    savedPower += removedPower;
+
+    setRelay(
+      devices[selectedDevice].relayPin,
+      false
+    );
+
+    Serial.print("SHED: ");
+    Serial.print(devices[selectedDevice].name);
+    Serial.print(" | ");
+    Serial.print(removedPower);
+    Serial.println(" W");
+  }
+}
+
+void restoreLoads() {
+  if (totalPower > PEAK_LIMIT * 0.75) {
+    return;
+  }
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    if (!devices[i].shed) {
+      continue;
+    }
+
+    devices[i].shed = false;
+
+    devices[i].currentPower =
+      devices[i].ratedPower;
+
+    setRelay(
+      devices[i].relayPin,
+      true
+    );
+
+    Serial.print("RESTORED: ");
+    Serial.println(devices[i].name);
+  }
+}
+
+void updatePhysicalRelays() {
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    if (devices[i].shed) {
+      setRelay(devices[i].relayPin, false);
+    }
+    else if (devices[i].enabled) {
+      setRelay(devices[i].relayPin, true);
+    }
+    else {
+      setRelay(devices[i].relayPin, false);
+    }
+  }
+}
+
+void printTelemetry() {
+  Serial.print("TOTAL_POWER=");
+  Serial.println(totalPower);
+
+  Serial.print("PREDICTED_POWER=");
+  Serial.println(predictedPower);
+
+  Serial.print("PEAK_LIMIT=");
+  Serial.println(PEAK_LIMIT);
+
+  Serial.print("SAVED_POWER=");
+  Serial.println(savedPower);
+
+  Serial.print("PEAK_BEFORE=");
+  Serial.println(peakBefore);
+
+  Serial.print("PEAK_AFTER=");
+  Serial.println(peakAfter);
+
+  Serial.println("DEVICE_DATA");
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    Serial.print(devices[i].name);
+    Serial.print(",");
+    Serial.print(devices[i].currentPower);
+    Serial.print(",");
+    Serial.print(devices[i].enabled);
+    Serial.print(",");
+    Serial.println(devices[i].shed);
+  }
+
+  Serial.println("END_DATA");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastUpdate >= UPDATE_INTERVAL) {
+    lastUpdate = currentTime;
+
+    simulatePower();
+
+    totalPower = calculateTotalPower();
+
+    if (totalPower > peakBefore) {
+      peakBefore = totalPower;
+    }
+
+    storePowerHistory(totalPower);
+
+    predictedPower = predictPower();
+
+    performPeakShaving();
+
+    totalPower = calculateTotalPower();
+
+    restoreLoads();
+
+    updatePhysicalRelays();
+
+    if (totalPower > peakAfter) {
+      peakAfter = totalPower;
+    }
+
+    printTelemetry();
+  }
+}
